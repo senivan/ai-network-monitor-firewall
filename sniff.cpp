@@ -29,12 +29,10 @@
 #include <iomanip>
 #include <string>
 
-// ----------------- CONFIG -----------------
 
 static const char *DEFAULT_IFACE = "eth0";
 static const char *CONTROL_PLANE_URL = "http://127.0.0.1:8000/sniffer-events";
 
-// ----------------- nDPI STATE -----------------
 
 struct FlowKey {
     uint32_t src_ip;   // network order
@@ -67,7 +65,6 @@ static uint32_t                      g_ndpi_flow_size = 0;
 static std::map<FlowKey, NdpiFlowState> g_ndpi_flows;
 static std::mutex                    g_ndpi_mutex;
 
-// ----------------- UTILS -----------------
 
 static std::string mac_to_string(const uint8_t *mac) {
     std::ostringstream oss;
@@ -112,7 +109,6 @@ static std::string infer_direction(uint32_t src_ip_net, uint32_t dst_ip_net) {
     return "outbound";
 }
 
-// JSON string escape (minimal)
 static std::string json_escape(const std::string &s) {
     std::string out;
     out.reserve(s.size() + 4);
@@ -138,7 +134,6 @@ static std::string json_escape(const std::string &s) {
     return out;
 }
 
-// Very rough TLS ClientHello SNI parser.
 static std::string extract_tls_sni(const uint8_t *data, size_t len) {
     if (len < 5) return "";
     uint8_t content_type = data[0];
@@ -160,25 +155,21 @@ static std::string extract_tls_sni(const uint8_t *data, size_t len) {
     if (offset + 2 + 32 > rec_len) return "";
     offset += 2 + 32;
 
-    // session id
     if (offset + 1 > rec_len) return "";
     uint8_t sid_len = hs[offset];
     offset += 1 + sid_len;
     if (offset > rec_len) return "";
 
-    // cipher suites
     if (offset + 2 > rec_len) return "";
     uint16_t cs_len = (hs[offset] << 8) | hs[offset + 1];
     offset += 2 + cs_len;
     if (offset > rec_len) return "";
 
-    // compression methods
     if (offset + 1 > rec_len) return "";
     uint8_t cm_len = hs[offset];
     offset += 1 + cm_len;
     if (offset > rec_len) return "";
 
-    // extensions
     if (offset + 2 > rec_len) return "";
     uint16_t ext_len = (hs[offset] << 8) | hs[offset + 1];
     offset += 2;
@@ -210,7 +201,6 @@ static std::string extract_tls_sni(const uint8_t *data, size_t len) {
     return "";
 }
 
-// ----------------- HTTP POST -----------------
 
 static std::mutex g_curl_mutex;
 
@@ -242,7 +232,6 @@ static void send_event_to_control_plane(const std::string &json_body) {
     curl_easy_cleanup(curl);
 }
 
-// ----------------- nDPI INIT/TEARDOWN -----------------
 
 static void ndpi_init_global() {
     g_ndpi_mod = ndpi_init_detection_module(ndpi_no_prefs);
@@ -298,7 +287,6 @@ static NdpiFlowState &get_ndpi_flow(const FlowKey &key) {
     return res.first->second;
 }
 
-// ----------------- PCAP CALLBACK -----------------
 
 static volatile bool g_stop = false;
 
@@ -401,7 +389,6 @@ static void packet_handler(
         }
     }
 
-    // Build protocol string
     std::string proto_str;
     switch (proto) {
     case IPPROTO_TCP:  proto_str = "tcp";  break;
@@ -462,7 +449,6 @@ static void packet_handler(
     send_event_to_control_plane(json.str());
 }
 
-// ----------------- MAIN -----------------
 
 int main(int argc, char **argv) {
     const char *iface = DEFAULT_IFACE;
