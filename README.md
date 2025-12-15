@@ -187,4 +187,33 @@ Increasing data volume significantly improves prediction quality.
 - The approach is scalable and suitable for real-time deployment.
 
 ---
+## 🚀 Run project
+
+All components are launched manually.
+write all text in markdown
+
+## 🚀 Run project
+
+Run the main application as a **Uvicorn** app:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+2. Start the packet sniffer (Data Plane)
+   
+Run the sniffer on the local network interface (LAN port, not WAN):
+```
+./sniffer <local_port>
+```
+
+4. Start the ML model
+   
+Launch the anomaly detection model:
+
+```
+python3 model.py
+```
+
+Runtime flow: The sniffer captures network traffic metadata. Data is forwarded to the Control Plane. The ML model computes anomaly scores.Firewall rules are dynamically updated via iptables.
 
