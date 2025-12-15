@@ -189,10 +189,6 @@ Increasing data volume significantly improves prediction quality.
 ---
 ## 🚀 Run project
 
-All components are launched manually.
-write all text in markdown
-
-## 🚀 Run project
 
 Run the main application as a **Uvicorn** app:
 
