@@ -1,10 +1,14 @@
 # main.py
 from __future__ import annotations
 
+import csv
 import ipaddress
 import logging
+import os
 import socket
+import subprocess
 import threading
+import time
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
@@ -25,17 +29,11 @@ log = logging.getLogger("ai_firewall")
 
 app = FastAPI(title="AI Firewall Control Plane")
 
-# -------------------------
-# Types
-# -------------------------
 
 DirectionType = Literal["inbound", "outbound"]
 ProtoType = Literal["tcp", "udp", "icmp", "any"]
 RuleActionType = Literal["allow", "block"]
-
-# -------------------------
-# Global state
-# -------------------------
+MlLabelType = Literal["normal", "anomaly"]
 
 events_lock = threading.Lock()
 events: Dict[int, "TrafficEvent"] = {}
@@ -51,9 +49,31 @@ dns_cache: Dict[str, str] = {}  # ip -> hostname
 local_ips_lock = threading.Lock()
 local_ips: set[str] = set()
 
-# -------------------------
-# Models
-# -------------------------
+# ML verdicts (external worker)
+ml_verdicts_lock = threading.Lock()
+ml_verdicts: Dict[int, "MlVerdict"] = {}
+
+# ML auto-block config
+ML_AUTOBLOCK_ENABLED = os.environ.get("AI_FW_ML_AUTOBLOCK", "true").lower() == "true"
+ML_AUTOBLOCK_THRESHOLD = float(os.environ.get("AI_FW_ML_AUTOBLOCK_THRESHOLD", "0.69"))
+
+# ML warmup & unblocking
+APP_START_TIME = datetime.utcnow()
+ML_WARMUP_SECONDS = int(os.environ.get("AI_FW_ML_WARMUP_SECONDS", "120"))
+ML_UNBLOCK_NORMAL_COUNT = int(os.environ.get("AI_FW_ML_UNBLOCK_NORMAL_COUNT", "5"))
+
+# Track ML-based blocks per dst
+# key: (dst_ip, dst_port_or_0, proto)
+# value: {"rule_ids": set[int], "normal_count": int, "last_label": str, "last_score": float, "last_update": datetime}
+ml_block_state_lock = threading.Lock()
+ml_block_state: Dict[tuple, dict] = {}
+
+# iptables integration
+IPTABLES_AVAILABLE = False
+
+# CSV dump config
+CSV_DIR = os.environ.get("AI_FW_CSV_DIR", "./event_logs")
+CSV_INTERVAL = int(os.environ.get("AI_FW_CSV_INTERVAL", "900"))  # seconds, 15 min default
 
 
 class FirewallRuleBase(BaseModel):
@@ -119,7 +139,6 @@ class TrafficEventCreate(BaseModel):
     ndpi_master_proto: Optional[str] = None
     ndpi_category: Optional[str] = None
 
-    # Free-form metadata bucket
     meta: dict = Field(default_factory=dict)
 
 
@@ -130,14 +149,12 @@ class TrafficEvent(TrafficEventCreate):
 
 
 class SnifferEvent(BaseModel):
-    # Mandatory fields from sniffer
     src_ip: IPvAnyAddress
     dst_ip: IPvAnyAddress
     src_port: Optional[int] = None
     dst_port: Optional[int] = None
     protocol: ProtoType = "any"
 
-    # Optional direction hint. If absent, we infer.
     direction: Optional[DirectionType] = None
 
     # L2/L3/L4
@@ -166,9 +183,142 @@ class SnifferEvent(BaseModel):
     timestamp_ms: Optional[int] = None
 
 
-# -------------------------
-# Helpers
-# -------------------------
+class MlVerdict(BaseModel):
+    event_id: int
+    model: Optional[str] = None
+    raw_error: Optional[float] = None
+    score: float
+    label: MlLabelType
+
+
+
+def _iptables_run(args: List[str]) -> bool:
+    cmd = ["/usr/sbin/iptables"] + args
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            log.warning("[iptables] %s failed: %s", " ".join(cmd), res.stderr.strip())
+            return False
+        return True
+    except FileNotFoundError:
+        log.error("[iptables] iptables command not found – dataplane disabled")
+        return False
+    except Exception as e:
+        log.error("[iptables] error running %s: %s", " ".join(cmd), e)
+        return False
+
+
+def _iptables_chain_exists(name: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["/usr/sbin/iptables", "-nL", name], capture_output=True, text=True
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _iptables_chain_has_jump(chain: str, target: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["/usr/sbin/iptables", "-nL", chain], capture_output=True, text=True
+        )
+        if res.returncode != 0:
+            return False
+        return target in res.stdout
+    except Exception:
+        return False
+
+
+def ensure_base_chains():
+    # Create custom chains if they don't exist
+    if not _iptables_chain_exists("AI_FIREWALL_IN"):
+        _iptables_run(["-N", "AI_FIREWALL_IN"])
+    if not _iptables_chain_exists("AI_FIREWALL_OUT"):
+        _iptables_run(["-N", "AI_FIREWALL_OUT"])
+
+    if not _iptables_chain_has_jump("INPUT", "AI_FIREWALL_IN"):
+        _iptables_run(["-I", "INPUT", "1", "-j", "AI_FIREWALL_IN"])
+    if not _iptables_chain_has_jump("OUTPUT", "AI_FIREWALL_OUT"):
+        _iptables_run(["-I", "OUTPUT", "1", "-j", "AI_FIREWALL_OUT"])
+
+
+def _iptables_flush_chain(name: str):
+    _iptables_run(["-F", name])
+
+
+def _build_match_args(r: FirewallRule) -> List[str]:
+    args: List[str] = []
+    if r.protocol and r.protocol != "any":
+        args += ["-p", r.protocol]
+    if r.src_ip:
+        args += ["-s", r.src_ip]
+    if r.dst_ip:
+        args += ["-d", r.dst_ip]
+    if r.src_port and (not r.protocol or r.protocol in ("tcp", "udp")):
+        args += ["--sport", str(r.src_port)]
+    if r.dst_port and (not r.protocol or r.protocol in ("tcp", "udp")):
+        args += ["--dport", str(r.dst_port)]
+    return args
+
+
+def rebuild_iptables_from_rules():
+    global IPTABLES_AVAILABLE
+    if not IPTABLES_AVAILABLE:
+        return
+
+    log.info("[iptables] Rebuilding AI firewall chains from rules")
+
+    ensure_base_chains()
+    _iptables_flush_chain("AI_FIREWALL_IN")
+    _iptables_flush_chain("AI_FIREWALL_OUT")
+
+    with rules_lock:
+        all_rules = list(rules.values())
+
+    for r in all_rules:
+        if r.action != "block":
+            continue
+
+        match_args = _build_match_args(r)
+
+        # direction controls which chain we place rule into
+        if r.direction == "inbound":
+            chains = ["AI_FIREWALL_IN"]
+        elif r.direction == "outbound":
+            chains = ["AI_FIREWALL_OUT"]
+        else:
+            chains = ["AI_FIREWALL_IN", "AI_FIREWALL_OUT"]
+
+        for chain in chains:
+            ok = _iptables_run(["-A", chain] + match_args + ["-j", "DROP"])
+            if not ok:
+                log.warning(
+                    "[iptables] Failed to install rule %d into %s", r.id, chain
+                )
+
+
+def init_iptables():
+    global IPTABLES_AVAILABLE
+    try:
+        res = subprocess.run(["/usr/sbin/iptables", "-L"], capture_output=True, text=True)
+        if res.returncode != 0:
+            log.warning(
+                "[iptables] iptables present but returned error: %s",
+                res.stderr.strip(),
+            )
+            IPTABLES_AVAILABLE = False
+            return
+        IPTABLES_AVAILABLE = True
+        log.info("[iptables] iptables detected, enabling dataplane integration")
+    except FileNotFoundError:
+        log.warning("[iptables] iptables not found, dataplane integration disabled")
+        IPTABLES_AVAILABLE = False
+        return
+
+    ensure_base_chains()
+    rebuild_iptables_from_rules()
+
 
 
 def detect_local_ips() -> set[str]:
@@ -291,14 +441,248 @@ def log_event_internal(ev: TrafficEventCreate, decision: FirewallDecision) -> Tr
         return te
 
 
-# -------------------------
-# FastAPI endpoints
-# -------------------------
+def _ml_block_key(ev: TrafficEvent) -> tuple:
+    return (str(ev.dst_ip), ev.dst_port or 0, ev.protocol)
+
+
+def register_ml_block(ev: TrafficEvent, rule_id: int, score: float):
+    key = _ml_block_key(ev)
+    now = datetime.utcnow()
+    with ml_block_state_lock:
+        st = ml_block_state.get(key)
+        if not st:
+            st = {
+                "rule_ids": set(),
+                "normal_count": 0,
+                "last_label": "anomaly",
+                "last_score": score,
+                "last_update": now,
+            }
+            ml_block_state[key] = st
+        st["rule_ids"].add(rule_id)
+        st["normal_count"] = 0
+        st["last_label"] = "anomaly"
+        st["last_score"] = score
+        st["last_update"] = now
+
+
+def update_ml_block_on_anomaly(ev: TrafficEvent, score: float):
+    key = _ml_block_key(ev)
+    now = datetime.utcnow()
+    with ml_block_state_lock:
+        st = ml_block_state.get(key)
+        if not st:
+            st = {
+                "rule_ids": set(),
+                "normal_count": 0,
+                "last_label": "anomaly",
+                "last_score": score,
+                "last_update": now,
+            }
+            ml_block_state[key] = st
+        st["normal_count"] = 0
+        st["last_label"] = "anomaly"
+        st["last_score"] = score
+        st["last_update"] = now
+
+
+def update_ml_block_on_normal(ev: TrafficEvent, score: float):
+    key = _ml_block_key(ev)
+    now = datetime.utcnow()
+    with ml_block_state_lock:
+        st = ml_block_state.get(key)
+        if not st:
+            return
+        st["normal_count"] += 1
+        st["last_label"] = "normal"
+        st["last_score"] = score
+        st["last_update"] = now
+        normal_count = st["normal_count"]
+        rule_ids = list(st["rule_ids"])
+
+    if normal_count < ML_UNBLOCK_NORMAL_COUNT:
+        return
+
+    # Enough normals – remove ML auto-block rules
+    with rules_lock:
+        for rid in rule_ids:
+            r = rules.get(rid)
+            if not r:
+                continue
+            if not r.description or not r.description.startswith("ML auto-block"):
+                continue
+            del rules[rid]
+
+    with ml_block_state_lock:
+        ml_block_state.pop(key, None)
+
+    rebuild_iptables_from_rules()
+    log.info(
+        "ML unblocked dst=%s port=%s proto=%s after %d normal verdicts",
+        key[0],
+        key[1] or "any",
+        key[2],
+        ML_UNBLOCK_NORMAL_COUNT,
+    )
+
+
+def create_ml_autoblock_rule_for_event(ev: TrafficEvent, score: float) -> Optional[FirewallRule]:
+    """
+    Create a simple block rule for this event's destination if none exists.
+    """
+    global _rule_counter
+
+    dst_ip = str(ev.dst_ip)
+    if not dst_ip:
+        return None
+
+    with rules_lock:
+        # avoid spamming identical rules
+        for r in rules.values():
+            if (
+                r.action == "block"
+                and r.dst_ip == dst_ip
+                and (r.dst_port == ev.dst_port or r.dst_port is None)
+                and (r.protocol == ev.protocol or r.protocol is None or r.protocol == "any")
+                and r.description
+                and r.description.startswith("ML auto-block")
+            ):
+                # already have an ML block for this dst
+                return None
+
+        _rule_counter += 1
+        new_rule = FirewallRule(
+            id=_rule_counter,
+            description=f"ML auto-block (score={score:.3f}) dst={dst_ip}",
+            direction=ev.direction,
+            src_ip=None,
+            dst_ip=dst_ip,
+            src_port=None,
+            dst_port=ev.dst_port,
+            protocol=ev.protocol,
+            action="block",
+        )
+        rules[new_rule.id] = new_rule
+
+    register_ml_block(ev, new_rule.id, score)
+
+    log.info(
+        "Created ML auto-block rule %d for event %d (dst=%s, score=%.3f)",
+        new_rule.id,
+        ev.id,
+        dst_ip,
+        score,
+    )
+    return new_rule
+
+
+def csv_dump_loop():
+    os.makedirs(CSV_DIR, exist_ok=True)
+    log.info("CSV dumping enabled: dir=%s interval=%ds", CSV_DIR, CSV_INTERVAL)
+    last_cut = datetime.utcnow()
+
+    while True:
+        time.sleep(CSV_INTERVAL)
+        now = datetime.utcnow()
+
+        with events_lock:
+            slice_events = [
+                e for e in events.values()
+                if last_cut <= e.timestamp < now
+            ]
+
+        if not slice_events:
+            last_cut = now
+            continue
+
+        # snapshot ML verdicts
+        with ml_verdicts_lock:
+            mv_map = dict(ml_verdicts)
+
+        filename = f"events_{last_cut.strftime('%Y%m%d_%H%M%S')}_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+        path = os.path.join(CSV_DIR, filename)
+
+        try:
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(
+                    [
+                        "id",
+                        "timestamp",
+                        "direction",
+                        "src_ip",
+                        "dst_ip",
+                        "src_port",
+                        "dst_port",
+                        "protocol",
+                        "src_mac",
+                        "dst_mac",
+                        "packet_len",
+                        "ip_ttl",
+                        "ip_tos",
+                        "ndpi_master_proto",
+                        "ndpi_app_proto",
+                        "ndpi_category",
+                        "dst_geo_country",
+                        "dst_geo_city",
+                        "tls_sni",
+                        "dns_qname",
+                        "dns_answer_ip",
+                        "ml_label",
+                        "ml_score",
+                    ]
+                )
+                for e in sorted(slice_events, key=lambda x: x.id):
+                    mv = mv_map.get(e.id)
+                    ml_label = mv.label if mv else e.meta.get("ml_label")
+                    ml_score = mv.score if mv else e.meta.get("ml_score")
+                    w.writerow(
+                        [
+                            e.id,
+                            e.timestamp.isoformat(),
+                            e.direction,
+                            str(e.src_ip),
+                            str(e.dst_ip),
+                            e.src_port or "",
+                            e.dst_port or "",
+                            e.protocol,
+                            e.src_mac or "",
+                            e.dst_mac or "",
+                            e.packet_len or "",
+                            e.ip_ttl or "",
+                            e.ip_tos or "",
+                            e.ndpi_master_proto or "",
+                            e.ndpi_app_proto or "",
+                            e.ndpi_category or "",
+                            e.dst_geo_country or "",
+                            e.dst_geo_city or "",
+                            e.tls_sni or "",
+                            e.dns_qname or "",
+                            str(e.dns_answer_ip) if e.dns_answer_ip else "",
+                            ml_label or "",
+                            f"{ml_score:.6f}" if isinstance(ml_score, (int, float)) else "",
+                        ]
+                    )
+            log.info("Dumped %d events to %s", len(slice_events), path)
+        except Exception as exc:
+            log.error("Failed to write CSV %s: %s", path, exc)
+
+        last_cut = now
+
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    warmup_left = max(
+        0,
+        ML_WARMUP_SECONDS - int((datetime.utcnow() - APP_START_TIME).total_seconds()),
+    )
+    return {
+        "status": "ok",
+        "ml_autoblock": ML_AUTOBLOCK_ENABLED,
+        "ml_threshold": ML_AUTOBLOCK_THRESHOLD,
+        "ml_warmup_seconds_left": warmup_left,
+    }
 
 
 @app.post("/sniffer-events", status_code=204)
@@ -330,21 +714,76 @@ def ingest_sniffer_event(ev: SnifferEvent):
         meta={"source": "cpp-sniffer", "timestamp_ms": ev.timestamp_ms},
     )
 
-    # Update DNS mapping if present
     augment_dns_mapping(tmp)
 
-    # Direction: from sniffer if valid, else infer from IPs
     if ev.direction in ("inbound", "outbound"):
         tmp.direction = ev.direction
     else:
         tmp.direction = infer_direction_from_ips(str(ev.src_ip), str(ev.dst_ip))
 
-    # Hostnames & Geo
     augment_hostnames(tmp)
     augment_geo(tmp)
 
     decision = decide_traffic_internal(tmp)
     log_event_internal(tmp, decision)
+    return
+
+
+@app.post("/ml/verdicts", status_code=204)
+def ingest_ml_verdict(v: MlVerdict):
+    """
+    Endpoint for the external ML worker.
+
+    Worker sends:
+        {
+          "event_id": int,
+          "model": "lstm_ae",
+          "raw_error": float,
+          "score": float,
+          "label": "normal" | "anomaly"
+        }
+    """
+    now = datetime.utcnow()
+    warmup = (now - APP_START_TIME).total_seconds() < ML_WARMUP_SECONDS
+
+    with ml_verdicts_lock:
+        ml_verdicts[v.event_id] = v
+
+    # Enrich event, if present
+    with events_lock:
+        ev = events.get(v.event_id)
+        if ev:
+            ev.meta["ml_score"] = v.score
+            ev.meta["ml_label"] = v.label
+            ev.meta["ml_model"] = v.model or "unknown"
+            ev.meta["ml_raw_error"] = v.raw_error
+
+    log.info(
+        "ML verdict for event %s: label=%s score=%.3f model=%s (warmup=%s)",
+        v.event_id,
+        v.label,
+        v.score,
+        v.model or "n/a",
+        warmup,
+    )
+
+    if not ev:
+        return
+
+    # Handle anomaly / normal with warmup + temporary blocks
+    if v.label == "anomaly":
+        # During warmup, don't auto-block at all
+        if ML_AUTOBLOCK_ENABLED and not warmup and v.score >= ML_AUTOBLOCK_THRESHOLD:
+            new_rule = create_ml_autoblock_rule_for_event(ev, v.score)
+            if new_rule:
+                rebuild_iptables_from_rules()
+        else:
+            # no rule created, but we still track anomaly state
+            update_ml_block_on_anomaly(ev, v.score)
+    elif v.label == "normal":
+        # Count consecutive normals and potentially unblock
+        update_ml_block_on_normal(ev, v.score)
+
     return
 
 
@@ -375,10 +814,10 @@ def create_rule(rule: FirewallRuleBase):
         _rule_counter += 1
         r = FirewallRule(id=_rule_counter, **rule.dict())
         rules[r.id] = r
-        return r
+    rebuild_iptables_from_rules()
+    return r
 
 
-# ----- Admin helper endpoints (add / delete / toggle rules) -----
 
 
 @app.get("/admin/add-rule")
@@ -419,6 +858,7 @@ def admin_delete_rule(rule_id: int):
     with rules_lock:
         if rule_id in rules:
             del rules[rule_id]
+    rebuild_iptables_from_rules()
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -428,7 +868,8 @@ def admin_toggle_rule(rule_id: int):
         r = rules.get(rule_id)
         if r:
             r.action = "allow" if r.action == "block" else "block"
-            rules[rule_id] = r
+            rules[r.id] = r
+    rebuild_iptables_from_rules()
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -479,6 +920,21 @@ def admin_page(limit: int = 200):
             if ev.dst_geo_city:
                 geo_info += f", {ev.dst_geo_city}"
 
+        # ML info
+        with ml_verdicts_lock:
+            mv = ml_verdicts.get(ev.id)
+        if mv:
+            ml_info = f"{mv.label} ({mv.score:.3f})"
+        else:
+            if "ml_label" in ev.meta:
+                try:
+                    s = float(ev.meta.get("ml_score", 0.0))
+                    ml_info = f"{ev.meta['ml_label']} ({s:.3f})"
+                except Exception:
+                    ml_info = str(ev.meta.get("ml_label", ""))
+            else:
+                ml_info = ""
+
         event_rows.append(
             f"<tr>"
             f"<td>{ev.id}</td>"
@@ -494,8 +950,13 @@ def admin_page(limit: int = 200):
             f"<td>{ndpi_info}</td>"
             f"<td>{geo_info}</td>"
             f"<td>{ev.decision.action}"
-            + (f" (rule {ev.decision.matched_rule_id})" if ev.decision.matched_rule_id else "")
+            + (
+                f" (rule {ev.decision.matched_rule_id})"
+                if ev.decision.matched_rule_id
+                else ""
+            )
             + "</td>"
+            f"<td>{ml_info}</td>"
             f"</tr>"
         )
 
@@ -520,11 +981,16 @@ def admin_page(limit: int = 200):
             f"</tr>"
         )
 
-    blocked_list_html = ""
-    if blocked_dst:
-        blocked_list_html = "<ul>" + "".join(f"<li>{ip}</li>" for ip in blocked_dst) + "</ul>"
-    else:
-        blocked_list_html = "<p>None</p>"
+    blocked_list_html = (
+        "<ul>" + "".join(f"<li>{ip}</li>" for ip in blocked_dst) + "</ul>"
+        if blocked_dst
+        else "<p>None</p>"
+    )
+
+    warmup_left = max(
+        0,
+        ML_WARMUP_SECONDS - int((datetime.utcnow() - APP_START_TIME).total_seconds()),
+    )
 
     html = f"""
     <html>
@@ -543,6 +1009,15 @@ def admin_page(limit: int = 200):
     </head>
     <body>
         <h1>AI Firewall – Admin</h1>
+
+        <h2>ML status</h2>
+        <p>
+            ML auto-block: <b>{'ENABLED' if ML_AUTOBLOCK_ENABLED else 'DISABLED'}</b>,
+            threshold: <b>{ML_AUTOBLOCK_THRESHOLD:.2f}</b><br/>
+            Warmup: <b>{ML_WARMUP_SECONDS}s</b>,
+            remaining: <b>{warmup_left}s</b><br/>
+            Unblock after <b>{ML_UNBLOCK_NORMAL_COUNT}</b> normal verdicts.
+        </p>
 
         <h2>Add rule</h2>
         <form method="get" action="/admin/add-rule">
@@ -641,6 +1116,7 @@ def admin_page(limit: int = 200):
                 <th>nDPI (master/app/category)</th>
                 <th>Geo</th>
                 <th>Decision</th>
+                <th>ML</th>
             </tr>
             {''.join(event_rows)}
         </table>
@@ -655,4 +1131,16 @@ def on_startup():
     global local_ips
     local_ips = detect_local_ips()
     log.info("Local IPs for direction detection: %s", local_ips)
-    log.info("AI Firewall control plane started")
+    log.info("AI Firewall control plane started at %s", APP_START_TIME.isoformat())
+    log.info(
+        "ML auto-block: %s (threshold=%.2f, warmup=%ds, unblock_normals=%d)",
+        "ENABLED" if ML_AUTOBLOCK_ENABLED else "DISABLED",
+        ML_AUTOBLOCK_THRESHOLD,
+        ML_WARMUP_SECONDS,
+        ML_UNBLOCK_NORMAL_COUNT,
+    )
+
+    init_iptables()
+
+    t = threading.Thread(target=csv_dump_loop, daemon=True)
+    t.start()
