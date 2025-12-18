@@ -685,6 +685,138 @@ def health():
     }
 
 
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Firewall – Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        body { font-family: sans-serif; background: #111; color: #eee; padding: 20px; }
+        select { background:#222; color:#eee; border:1px solid #555; padding:6px; }
+        canvas { background:#0d0d0d; margin-top:20px; }
+    </style>
+</head>
+
+<body>
+
+<h1>User activity dashboard</h1>
+
+<label>User (src IP): </label>
+<select id="userSelect"></select>
+
+<h3>Traffic categories</h3>
+<canvas id="catChart" height="120"></canvas>
+
+<h3>Timeline</h3>
+<canvas id="timeChart" height="120"></canvas>
+
+<script>
+let catChart = null;
+let timeChart = null;
+
+async function loadUsers() {
+    const res = await fetch("/users");
+    const users = await res.json();
+
+    const sel = document.getElementById("userSelect");
+    sel.innerHTML = "";
+
+    users.forEach(ip => {
+        const o = document.createElement("option");
+        o.value = ip;
+        o.textContent = ip;
+        sel.appendChild(o);
+    });
+
+    if (users.length > 0) {
+        sel.value = users[0];
+        loadActivity();
+    }
+}
+
+async function loadActivity() {
+    const ip = document.getElementById("userSelect").value;
+    if (!ip) return;
+
+    const res = await fetch("/users/" + ip + "/activity");
+    const data = await res.json();
+
+    // ---- BAR ----
+    if (catChart) catChart.destroy();
+    catChart = new Chart(document.getElementById("catChart"), {
+        type: "bar",
+        data: {
+            labels: Object.keys(data.categories),
+            datasets: [{
+                label: "Connections",
+                data: Object.values(data.categories),
+                backgroundColor: "#3fa9f5"
+            }]
+        },
+        options: { scales: { y: { beginAtZero: true } } }
+    });
+
+    // ---- LINE ----
+    if (timeChart) timeChart.destroy();
+    timeChart = new Chart(document.getElementById("timeChart"), {
+        type: "line",
+        data: {
+            labels: data.timeline.map(p => p.time),
+            datasets: [{
+                label: "Events",
+                data: data.timeline.map(p => p.count),
+                borderColor: "#00e676",
+                tension: 0.3,
+                fill: false
+            }]
+        },
+        options: { scales: { y: { beginAtZero: true } } }
+    });
+}
+
+document.getElementById("userSelect").addEventListener("change", loadActivity);
+loadUsers();
+</script>
+
+</body>
+</html>
+"""
+    return HTMLResponse(html)
+
+@app.get("/users")
+def users():
+    with events_lock:
+        return sorted({str(e.src_ip) for e in events.values()})
+
+
+
+@app.get("/users/{ip}/activity")
+def user_activity(ip: str):
+    from collections import Counter, defaultdict
+
+    with events_lock:
+        evs = [e for e in events.values() if str(e.src_ip) == ip]
+
+    categories = Counter(e.ndpi_category or "Unknown" for e in evs)
+
+    timeline = defaultdict(int)
+    for e in evs:
+        t = e.timestamp.strftime("%H:%M")
+        timeline[t] += 1
+
+    return {
+        "categories": categories,
+        "timeline": [
+            {"time": k, "count": v}
+            for k, v in sorted(timeline.items())
+        ]
+    }
+
+
 @app.post("/sniffer-events", status_code=204)
 def ingest_sniffer_event(ev: SnifferEvent):
     log.info("sniffer event: %s -> %s proto=%s", ev.src_mac, ev.dst_mac, ev.protocol)
